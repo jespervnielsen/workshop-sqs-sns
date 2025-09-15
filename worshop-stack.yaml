@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SNS -> SQS -> Lambda demo with 2-day log retention
+
+Parameters:
+  Initials:
+    Type: String
+    Default: 'XXXX'
+    Description: Unique tag (e.g., initials) for resource names
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    MinLength: 4
+    MaxLength: 6
+
+Resources:
+  #### SNS Topic ####
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Initials}-demo-topic"
+
+  #### SQS Queue ####
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Initials}-demo-queue"
+
+  #### SNS Subscription -> SQS ####
+  SnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SQSQueue.Arn
+
+  #### SQS Queue Policy (allow SNS to publish) ####
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SQSQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt SQSQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref SNSTopic
+
+  #### Producer Lambda ####
+  ProducerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Initials}-producer"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+          const client = new SNSClient({});
+
+          exports.handler = async (event) => {
+            const numberOfMessages = 10; // Justér antal beskeder her
+
+            for (let i = 0; i < numberOfMessages; i++) {
+              const params = {
+                TopicArn: process.env.TOPIC_ARN,
+                Message: JSON.stringify({
+                  id: `xyz-${i}-${Math.floor(Math.random() * 1000)}`,
+                  text: `Hej fra ProducerLambda! Message ${i}`
+                }),
+                MessageAttributes: {
+                  itemId: {
+                    DataType: "String",
+                    StringValue: i.toString()
+                  }
+                }
+              };
+
+              const result = await client.send(new PublishCommand(params));
+              console.log(`Published message ${i}, MessageId: ${result.MessageId}`);
+            }
+
+            return { status: "ok", sent: numberOfMessages };
+          };
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref SNSTopic
+
+  #### Consumer Lambda ####
+  ConsumerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Initials}-consumer"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            for (const record of event.Records) {
+              console.log("Raw record:", record);
+
+              // Parse SQS body
+              let payload;
+              try {
+                const body = JSON.parse(record.body); // SQS body is string
+                // Check if it's wrapped from SNS
+                  payload = body;
+
+              } catch (e) {
+                console.error("Failed to parse body:", e);
+                continue;
+              }
+
+              const itemId = record.messageAttributes?.itemId?.stringValue || "N/A";
+              console.log("Consumer received payload:", payload);
+              console.log("Consumer received itemId:", itemId);
+            }
+            return { status: "done" };
+          }
+
+  #### SQS -> Consumer Lambda Event Source Mapping ####
+  LambdaSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !Ref ConsumerLambda
+      BatchSize: 1
+      Enabled: true
+
+  #### Execution Role ####
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Initials}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishToSNS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SQSQueue.Arn
+
+  #### Log Groups with 2-day retention ####
+  ProducerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: ProducerLambda
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Initials}-producer"
+      RetentionInDays: 1
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: ConsumerLambda
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Initials}-consumer"
+      RetentionInDays: 1
+
+Outputs:
+  TopicArn:
+    Value: !Ref SNSTopic
+    Description: SNS Topic ARN
+  QueueUrl:
+    Value: !Ref SQSQueue
+    Description: SQS Queue URL
+  ProducerLambdaName:
+    Value: !Ref ProducerLambda
+  ConsumerLambdaName:
+    Value: !Ref ConsumerLambda
